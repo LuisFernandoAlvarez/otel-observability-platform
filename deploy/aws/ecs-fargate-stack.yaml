@@ -1,0 +1,382 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Fargate cluster with OTel Collector, service-a, and service-b for observability'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  ClusterName:
+    Type: String
+    Default: otel-observability
+    Description: ECS cluster name
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for ECS tasks
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for ECS tasks
+
+  DatabaseEndpoint:
+    Type: String
+    Description: RDS database endpoint (e.g., db.example.us-east-1.rds.amazonaws.com)
+
+  DatabaseName:
+    Type: String
+    Default: postgres
+    Description: Database name
+
+  DatabaseUser:
+    Type: String
+    Default: postgres
+    Description: Database user
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: Database password (consider using Secrets Manager)
+
+Resources:
+  # CloudWatch Log Groups
+  LogGroupServiceA:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/otel-observability/service-a'
+      RetentionInDays: 7
+
+  LogGroupServiceB:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/otel-observability/service-b'
+      RetentionInDays: 7
+
+  LogGroupCollector:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/otel-observability/collector'
+      RetentionInDays: 7
+
+  # IAM Role for ECS tasks
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ECS Cluster
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # Security Group for ALB
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+
+  # Security Group for ECS tasks
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 4317
+          ToPort: 4318
+          CidrIp: 10.0.0.0/8  # Adjust to your VPC CIDR
+
+  # ALB for service-a
+  AlbServiceA:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: otel-service-a-alb
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Type: application
+
+  TargetGroupServiceA:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: otel-service-a-tg
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+
+  ListenerServiceA:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !GetAtt AlbServiceA.LoadBalancerArn
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !GetAtt TargetGroupServiceA.TargetGroupArn
+
+  # ECS Task Definition for OTel Collector
+  OtelCollectorTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-collector
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: otel-collector
+          Image: otel/opentelemetry-collector-contrib:0.104.0
+          PortMappings:
+            - ContainerPort: 4317
+              Protocol: tcp
+            - ContainerPort: 4318
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupCollector
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          # Note: In production, mount the config from S3 or use a config map
+          Command:
+            - "--config=/etc/otelcol/config.yaml"
+
+  # ECS Service for OTel Collector
+  OtelCollectorService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: otel-collector
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref OtelCollectorTaskDef
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+
+  # ECS Task Definition for service-a
+  ServiceATaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: service-a
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: service-a
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/otel-observability/service-a:latest'
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: SERVICE_NAME
+              Value: service-a
+            - Name: OTEL_SERVICE_NAME
+              Value: service-a
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: !Sub 'http://otel-collector-${Environment}:4318'
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: SERVICE_B_URL
+              Value: !Sub 'http://service-b-${Environment}.internal:8000'
+            - Name: DATABASE_URL
+              Value: !Sub 'postgresql+psycopg2://${DatabaseUser}:${DatabasePassword}@${DatabaseEndpoint}:5432/service_a'
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub 'service.name=service-a,deployment.environment=${Environment},aws.ecs.cluster.name=${ClusterName}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupServiceA
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Service for service-a
+  ServiceAService:
+    Type: AWS::ECS::Service
+    DependsOn: ListenerServiceA
+    Properties:
+      ServiceName: service-a
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ServiceATaskDef
+      DesiredCount: 2
+      LaunchType: FARGATE
+      LoadBalancers:
+        - ContainerName: service-a
+          ContainerPort: 8000
+          TargetGroupArn: !GetAtt TargetGroupServiceA.TargetGroupArn
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+
+  # ECS Task Definition for service-b
+  ServiceBTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: service-b
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: service-b
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/otel-observability/service-b:latest'
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: SERVICE_NAME
+              Value: service-b
+            - Name: OTEL_SERVICE_NAME
+              Value: service-b
+            - Name: OTEL_EXPORTER_OTLP_ENDPOINT
+              Value: !Sub 'http://otel-collector-${Environment}:4318'
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: DATABASE_URL
+              Value: !Sub 'postgresql+psycopg2://${DatabaseUser}:${DatabasePassword}@${DatabaseEndpoint}:5432/service_b'
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub 'service.name=service-b,deployment.environment=${Environment},aws.ecs.cluster.name=${ClusterName}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroupServiceB
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Service for service-b
+  ServiceBService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: service-b
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ServiceBTaskDef
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref EcsSecurityGroup
+
+Outputs:
+  ClusterName:
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ClusterName'
+
+  ServiceAUrl:
+    Value: !GetAtt AlbServiceA.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ServiceAUrl'
+
+  LogGroupServiceA:
+    Value: !Ref LogGroupServiceA
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupServiceA'
+
+  LogGroupServiceB:
+    Value: !Ref LogGroupServiceB
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupServiceB'

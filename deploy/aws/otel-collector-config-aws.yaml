@@ -1,0 +1,73 @@
+# OTel Collector configuration for AWS
+# Exports traces to X-Ray, logs to CloudWatch Logs, and metrics to CloudWatch
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    limit_mib: 256
+    spike_limit_mib: 64
+    check_interval: 5s
+
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: aws
+        action: upsert
+      - key: aws.region
+        value: ${AWS_REGION}
+        action: upsert
+
+  attributes:
+    actions:
+      - key: service.namespace
+        value: otel-observability
+        action: upsert
+
+exporters:
+  logging:
+    loglevel: debug
+
+  awsxray:
+    region: ${AWS_REGION}
+    local_mode: false  # set to true for local testing with X-Ray daemon
+
+  awsemf:
+    log_group_name: /ecs/otel-observability/metrics
+    log_stream_name: metrics-stream
+    namespace: OTelCollector
+    region: ${AWS_REGION}
+    resource_detection_enabled: true
+    use_insecure: false
+
+  awscloudwatchlogs:
+    log_group_name: /ecs/otel-observability/logs
+    log_stream_name: collector-logs
+    region: ${AWS_REGION}
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, attributes, batch]
+      exporters: [awsxray, logging]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, attributes, batch]
+      exporters: [awsemf, logging]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, attributes, batch]
+      exporters: [awscloudwatchlogs, logging]
