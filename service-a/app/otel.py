@@ -1,0 +1,99 @@
+import json
+import logging
+import os
+from datetime import datetime, timezone
+
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+
+logger = logging.getLogger(__name__)
+
+
+class TraceContextFilter(logging.Filter):
+    def filter(self, record):
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        record.trace_id = format(ctx.trace_id, "032x") if ctx.is_valid else None
+        record.span_id = format(ctx.span_id, "016x") if ctx.is_valid else None
+        return True
+
+
+class JsonFormatter(logging.Formatter):
+    reserved = {
+        "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
+        "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
+        "created", "msecs", "relativeCreated", "thread", "threadName",
+        "processName", "process", "message", "asctime"
+    }
+
+    def format(self, record):
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "service": os.getenv("SERVICE_NAME", "unknown-service"),
+        }
+        if getattr(record, "trace_id", None):
+            payload["trace_id"] = record.trace_id
+        if getattr(record, "span_id", None):
+            payload["span_id"] = record.span_id
+        for key, value in record.__dict__.items():
+            if key not in self.reserved and not key.startswith("_"):
+                payload[key] = value
+        return json.dumps(payload, default=str)
+
+
+def setup_logging():
+    base_logger = logging.getLogger()
+    base_logger.setLevel(logging.INFO)
+
+    if not base_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonFormatter())
+        handler.addFilter(TraceContextFilter())
+        base_logger.addHandler(handler)
+
+    for handler in base_logger.handlers:
+        handler.setFormatter(JsonFormatter())
+        handler.addFilter(TraceContextFilter())
+
+
+def configure_otel(service_name: str) -> None:
+    resource = Resource.create({
+        "service.name": service_name,
+        "deployment.environment": os.getenv("OTEL_DEPLOYMENT_ENVIRONMENT", "local"),
+    })
+
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318") + "/v1/traces")
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+
+    metrics_reader = PeriodicExportingMetricReader(
+        OTLPMetricExporter(endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318") + "/v1/metrics"),
+        export_interval_millis=5000,
+    )
+    meter_provider = MeterProvider(resource=resource, metric_readers=[metrics_reader])
+
+    from opentelemetry import metrics
+    metrics.set_meter_provider(meter_provider)
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+
+    from opentelemetry.trace import set_tracer_provider
+    set_tracer_provider(provider)
+
+    RequestsInstrumentor().instrument()
+    SQLAlchemyInstrumentor().instrument()
+
+    logger.info("OpenTelemetry configured")
+    setup_logging()
+
+    return None
