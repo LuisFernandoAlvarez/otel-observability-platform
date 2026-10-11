@@ -1,0 +1,35 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: "5"
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 300
+      containers:
+        - image: otel/opentelemetry-collector-contrib:0.104.0
+          ports:
+            - containerPort: 4317
+            - containerPort: 4318
+            - containerPort: 8888
+            - containerPort: 8889
+          args:
+            - "--config=/etc/otelcol/config.yaml"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otelcol
+          env:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: YOUR_PROJECT_ID
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config

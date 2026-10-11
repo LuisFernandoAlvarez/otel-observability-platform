@@ -1,0 +1,90 @@
+# GCP deployment (Cloud Run + OTel Collector)
+
+This directory contains a Cloud Run-oriented deployment recipe for the two-service observability stack.
+
+## Target architecture
+
+- service-a in Cloud Run
+- service-b in Cloud Run
+- OTel Collector in Cloud Run
+- Jaeger in Cloud Run or GKE/Compute VM if you prefer a dedicated trace backend
+- Prometheus + Grafana in GKE, Cloud Run, or a managed service like Google Cloud Monitoring + Grafana Cloud
+
+## Prerequisites
+
+- gcloud CLI installed and authenticated
+- project created: `gcloud projects create ...` or use an existing one
+- Cloud Run enabled and Artifact Registry configured
+
+```bash
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com logging.googleapis.com monitoring.googleapis.com
+```
+
+## Build and push container images
+
+From repository root:
+
+```bash
+export PROJECT_ID=YOUR_PROJECT_ID
+export REGION=us-central1
+export REPO=otel-observability
+
+# Service A
+# If using Artifact Registry:
+gcloud artifacts repositories create $REPO \
+  --repository-format=docker \
+  --location=$REGION \
+  --description="OTel observability images"
+
+# Build and push
+# (adjust these commands if you keep app paths as-is)
+docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/service-a ./service-a
+docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/service-a
+
+docker build -t $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/service-b ./service-b
+docker push $REGION-docker.pkg.dev/$PROJECT_ID/$REPO/service-b
+```
+
+## Deploy collector
+
+Update the image reference in `cloud-run-otel-collector.yaml` before applying:
+
+```bash
+gcloud run services replace deploy/gcp/cloud-run-otel-collector.yaml --region=$REGION
+```
+
+## Deploy services
+
+```bash
+gcloud run services replace deploy/gcp/cloud-run-service-a.yaml --region=$REGION
+gcloud run services replace deploy/gcp/cloud-run-service-b.yaml --region=$REGION
+```
+
+## Environment variables
+
+For service-a / service-b set:
+
+```bash
+OTEL_SERVICE_NAME=service-a
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.<region>.run.app:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+SERVICE_B_URL=http://service-b.<region>.run.app
+DATABASE_URL=postgresql+psycopg2://user:pass@host:5432/db
+```
+
+## Notes
+
+- For production, prefer Cloud SQL instead of local PostgreSQL.
+- Use a private VPC connector if the collector and the database must not be internet-exposed.
+- In a more operational setup, Jaeger runs as a dedicated service behind Cloud Run or GKE; Prometheus and Grafana can be placed behind a private ingress or hooked to managed observability services.
+- If using Cloud Logging, export logs from the collector via the Google Cloud exporter and correlate by `trace_id`.
+
+## Example requests
+
+```bash
+curl -X POST https://service-a-<hash>-uc.a.run.app/process \
+  -H 'Content-Type: application/json' \
+  -d '{"customer":"alice","item":"laptop","quantity":2,"amount":1200.00}'
+```
